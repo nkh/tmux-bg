@@ -88,7 +88,8 @@ window_title() {
 switch_to_window() {
     local target=$1
     local current_session
-    current_session="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}')"
+    # current_session="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}')"
+    current_session="$(tmux display-message -p '#{session_name}')"
 
     # The manager session acts as a temporary workspace. Pressing switch
     # while already there returns to the client's previous session.
