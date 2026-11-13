@@ -19,7 +19,8 @@ Usage:
 
 Commands:
   run       Start PROGRAM in a detached managed window.
-  switch    Pick a managed window with fzf and switch to it.
+  switch    Pick a managed window with fzf and switch to it. From inside
+            the manager session, switch straight back to the previous one.
   kill      Pick one or more managed windows with fzf and kill them.
   list      Print managed windows.
   clean-up  Remove managed windows whose panes have exited.
@@ -51,6 +52,14 @@ require_fzf() {
 
 session_exists() {
     tmux has-session -t "=$SESSION" 2>/dev/null
+}
+
+current_session() {
+    # No explicit -t target: TMUX_PANE is not set inside display-popup or
+    # run-shell jobs (they are not panes), and `set -u` aborts on it.
+    # Without -t, tmux resolves the current pane when run from a pane and
+    # the invoking client's session when run from a popup.
+    tmux display-message -p '#{session_name}'
 }
 
 window_option() {
@@ -87,14 +96,12 @@ window_title() {
 
 switch_to_window() {
     local target=$1
-    local current_session
-    # current_session="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}')"
-    current_session="$(tmux display-message -p '#{session_name}')"
 
-    # The manager session acts as a temporary workspace. Pressing switch
-    # while already there returns to the client's previous session.
-    if [[ "$current_session" == "$SESSION" ]]; then
-        tmux switch-client -l
+    # Already in the manager session: select the window in place. Going
+    # through switch-client here would be wrong for `run --attach`, which
+    # is asked to show a program, not to leave the manager session.
+    if [[ "$(current_session)" == "$SESSION" ]]; then
+        tmux select-window -t "$target"
         return
     fi
 
@@ -200,6 +207,17 @@ picker_records() {
 pick_windows() {
     local action=$1
     require_tmux
+
+    # Pressing switch while already in the manager session is the toggle:
+    # return the client to its previous session, without opening the picker.
+    if [[ "$action" == "switch" ]] && [[ "$(current_session)" == "$SESSION" ]]; then
+        if tmux switch-client -l 2>/dev/null; then
+            return 0
+        fi
+        # No previous session to return to (none recorded, or it died):
+        # fall through to the picker so the key still does something useful.
+    fi
+
     require_fzf
     session_exists || die "session '$SESSION' does not exist"
 
