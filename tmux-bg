@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+#
+# tmux-bg - run and manage one program window per program/directory.
+#
+set -euo pipefail
+
+DEFAULT_SESSION="programs"
+SESSION="$DEFAULT_SESSION"
+ATTACH_AFTER_START=0
+
+usage() {
+    cat <<'EOF'
+Usage:
+  tmux-bg [--session NAME] run [--attach] PROGRAM [ARG...]
+  tmux-bg [--session NAME] switch
+  tmux-bg [--session NAME] kill
+  tmux-bg [--session NAME] list
+  tmux-bg [--session NAME] clean-up
+
+Commands:
+  run       Start PROGRAM in a detached managed window.
+  switch    Pick a managed window with fzf and switch to it.
+  kill      Pick one or more managed windows with fzf and kill them.
+  list      Print managed windows.
+  clean-up  Remove managed windows whose panes have exited.
+
+Options:
+  --session NAME   Use another tmux session (default: programs).
+  --attach         After starting or finding a program, switch to it.
+  -h, --help       Show this help.
+
+The run command is detached by default. PROGRAM is identified by its resolved
+executable path and the canonical current directory. Arguments do not create
+separate instances: the same executable in the same directory is one instance.
+EOF
+}
+
+die() {
+    printf 'tmux-bg: %s\n' "$*" >&2
+    exit 1
+}
+
+require_tmux() {
+    [[ -n "${TMUX:-}" ]] || die "must be run inside tmux"
+    command -v tmux >/dev/null 2>&1 || die "tmux not found"
+}
+
+require_fzf() {
+    command -v fzf >/dev/null 2>&1 || die "fzf is required for this command"
+}
+
+session_exists() {
+    tmux has-session -t "=$SESSION" 2>/dev/null
+}
+
+window_option() {
+    local target=$1 option=$2
+    tmux show-option -wqv -t "$target" "$option" 2>/dev/null || true
+}
+
+managed_windows() {
+    local window program directory
+    while IFS= read -r window; do
+        [[ -n "$window" ]] || continue
+        program="$(window_option "$window" @managed_program)"
+        [[ -n "$program" ]] || continue
+        directory="$(window_option "$window" @managed_directory)"
+        printf '%s\t%s\t%s\n' "$window" "$program" "$directory"
+    done < <(tmux list-windows -t "=$SESSION" -F '#{window_id}' 2>/dev/null)
+}
+
+safe_display() {
+    # Keep fzf's tab-separated record format intact.
+    local value=$1
+    value=${value//$'\t'/ }
+    value=${value//$'\n'/ }
+    printf '%s' "$value"
+}
+
+window_title() {
+    local program=$1 directory=$2
+    local base
+    base="$(basename -- "$directory")"
+    [[ -n "$base" ]] || base="/"
+    printf '%s - %s' "$(basename -- "$program")" "$base"
+}
+
+switch_to_window() {
+    local target=$1
+    local current_session
+    current_session="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}')"
+
+    # The manager session acts as a temporary workspace. Pressing switch
+    # while already there returns to the client's previous session.
+    if [[ "$current_session" == "$SESSION" ]]; then
+        tmux switch-client -l
+        return
+    fi
+
+    tmux switch-client -t "=$SESSION"
+    tmux select-window -t "$target"
+}
+
+find_existing() {
+    local wanted_program=$1 wanted_directory=$2
+    local window program directory
+
+    while IFS=$'\t' read -r window program directory; do
+        [[ -n "$window" ]] || continue
+        if [[ "$program" == "$wanted_program" &&
+              "$directory" == "$wanted_directory" ]]; then
+            printf '%s\n' "$window"
+            return 0
+        fi
+    done < <(managed_windows)
+    return 1
+}
+
+run_program() {
+    local attach=$ATTACH_AFTER_START
+    if [[ "${1:-}" == "--attach" ]]; then
+        attach=1
+        shift
+    fi
+    [[ "${1:-}" != "--" ]] || shift
+    (($# >= 1)) || die "run requires PROGRAM [ARG...]"
+
+    local requested=$1
+    shift
+
+    local executable
+    executable="$(command -v -- "$requested")" ||
+        die "program not found: $requested"
+    executable="$(readlink -f -- "$executable")" ||
+        die "cannot resolve executable: $requested"
+    [[ -x "$executable" ]] || die "not executable: $executable"
+
+    local directory
+    directory="$(pwd -P)"
+
+    require_tmux
+
+    if session_exists; then
+        local existing
+        if existing="$(find_existing "$executable" "$directory")"; then
+            printf 'Already running: %s in %s\n' "$requested" "$directory"
+            if (( attach )); then
+                switch_to_window "$existing"
+            fi
+            return 0
+        fi
+    fi
+
+    # Quote every argument for the shell tmux uses to start the pane command.
+    local command_line
+    printf -v command_line '%q ' "$executable" "$@"
+    command_line="exec ${command_line% }"
+
+    local title window_id
+    title="$(window_title "$executable" "$directory")"
+
+    if session_exists; then
+        window_id="$(
+            tmux new-window -d -P -F '#{window_id}' \
+                -t "=$SESSION" -c "$directory" -n "$title" "$command_line"
+        )"
+    else
+        window_id="$(
+            tmux new-session -d -P -F '#{window_id}' \
+                -s "$SESSION" -c "$directory" -n "$title" "$command_line"
+        )"
+    fi
+
+    tmux set-option -w -t "$window_id" @managed_program "$executable"
+    tmux set-option -w -t "$window_id" @managed_directory "$directory"
+    tmux set-option -w -t "$window_id" @managed_title "$title"
+    tmux set-option -w -t "$window_id" @managed_version "1"
+
+    printf 'Started %s in session %s: %s\n' "$requested" "$SESSION" "$title"
+    if (( attach )); then
+        switch_to_window "$window_id"
+    fi
+}
+
+picker_records() {
+    local window program directory title
+    while IFS=$'\t' read -r window program directory; do
+        [[ -n "$window" ]] || continue
+        title="$(window_option "$window" @managed_title)"
+        [[ -n "$title" ]] || title="$(window_title "$program" "$directory")"
+        printf '%s\t%s\t%s\t%s\n' \
+            "$window" \
+            "$(safe_display "$title")" \
+            "$(safe_display "$directory")" \
+            "$(safe_display "$program")"
+    done < <(managed_windows)
+}
+
+pick_windows() {
+    local action=$1
+    require_tmux
+    require_fzf
+    session_exists || die "session '$SESSION' does not exist"
+
+    local records
+    records="$(picker_records)"
+    [[ -n "$records" ]] || die "no managed programs in session '$SESSION'"
+
+    local selected
+    if [[ "$action" == "kill" ]]; then
+        selected="$(
+            printf '%s\n' "$records" |
+                fzf --multi \
+                    --delimiter=$'\t' --with-nth='2..' \
+                    --prompt='Kill programs > ' \
+                    --header='Tab: mark multiple  Enter: kill  Esc: cancel' \
+                    --preview='tmux capture-pane -p -e -t {1}' \
+                    --preview-window='right,60%,border-left'
+        )" || return 0
+    else
+        selected="$(
+            printf '%s\n' "$records" |
+                fzf \
+                    --delimiter=$'\t' --with-nth='2..' \
+                    --prompt='Programs > ' \
+                    --header='Enter: switch  Esc: cancel' \
+                    --preview='tmux capture-pane -p -e -t {1}' \
+                    --preview-window='right,60%,border-left'
+        )" || return 0
+    fi
+
+    [[ -n "$selected" ]] || return 0
+
+    if [[ "$action" == "kill" ]]; then
+        while IFS= read -r line; do
+            local target=${line%%$'\t'*}
+            [[ -n "$target" ]] || continue
+            tmux kill-window -t "$target"
+            printf 'Killed %s\n' "$target"
+        done <<< "$selected"
+    else
+        local target=${selected%%$'\t'*}
+        switch_to_window "$target"
+    fi
+}
+
+list_programs() {
+    require_tmux
+    if ! session_exists; then
+        printf 'No session: %s\n' "$SESSION"
+        return 0
+    fi
+
+    printf '%-10s  %-32s  %s\n' "WINDOW" "PROGRAM" "DIRECTORY"
+    while IFS=$'\t' read -r window program directory; do
+        [[ -n "$window" ]] || continue
+        printf '%-10s  %-32s  %s\n' "$window" \
+            "$(basename -- "$program")" "$directory"
+    done < <(managed_windows)
+}
+
+clean_up() {
+    require_tmux
+    if ! session_exists; then
+        printf 'Nothing to clean: session %s does not exist\n' "$SESSION"
+        return 0
+    fi
+
+    local window dead killed=0
+    while IFS= read -r window; do
+        [[ -n "$window" ]] || continue
+        [[ -n "$(window_option "$window" @managed_program)" ]] || continue
+
+        # Only remove a window when all of its panes have exited.
+        dead="$(
+            tmux list-panes -t "$window" -F '#{pane_dead}' 2>/dev/null |
+                sort -u
+        )"
+        if [[ "$dead" == "1" ]]; then
+            tmux kill-window -t "$window"
+            printf 'Removed dead managed window %s\n' "$window"
+            ((killed += 1))
+        fi
+    done < <(tmux list-windows -t "=$SESSION" -F '#{window_id}')
+
+    printf 'Clean-up complete: %d dead window(s) removed\n' "$killed"
+}
+
+main() {
+    require_tmux
+
+    while (($#)); do
+        case "$1" in
+            --session)
+                (($# >= 2)) || die "--session requires a name"
+                SESSION=$2
+                shift 2
+                ;;
+            --attach)
+                ATTACH_AFTER_START=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    [[ -n "$SESSION" ]] || die "session name cannot be empty"
+    (($# >= 1)) || { usage; return 2; }
+
+    local command=$1
+    shift
+
+    case "$command" in
+        run)      run_program "$@" ;;
+        switch|pick) pick_windows switch ;;
+        kill)     pick_windows kill ;;
+        list)     list_programs ;;
+        clean-up|cleanup) clean_up ;;
+        help)     usage ;;
+        *)        die "unknown command: $command (try --help)" ;;
+    esac
+}
+
+main "$@"
