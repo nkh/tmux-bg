@@ -168,7 +168,7 @@ Normally tmux closes a window when its command exits. If the tmux
 Add this to `~/.tmux.conf`:
 
 ```tmux
-bind-key P display-popup -E -w 90% -h 80%  "tmux-bg switch"
+bind-key P display-popup -E -w 95% -h 90%  "tmux-bg switch"
 ```
 
 Reload the configuration:

@@ -241,10 +241,8 @@ pick_windows() {
             printf '%s\n' "$records" |
                 fzf \
                     --delimiter=$'\t' --with-nth='2..' \
-                    --prompt='Programs > ' \
-                    --header='Enter: switch  Esc: cancel' \
                     --preview='tmux capture-pane -p -e -t {1}' \
-                    --preview-window='right,60%,border-left'
+                    --preview-window='bottom,75%,border-top'
         )" || return 0
     fi
 
