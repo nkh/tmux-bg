@@ -9,6 +9,8 @@ The default session is `programs`. It is created automatically when the first
 program is launched. Launches are detached/backgrounded by default: the
 current tmux client stays where it is.
 
+![UI](https://github.com/nkh/tmux-bg/blob/main/screenshots/ss1.png)
+
 ## Requirements
 
 - tmux

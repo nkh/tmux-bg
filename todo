@@ -4,7 +4,7 @@
 Arguments do not create separate instances: the same executable in the same directory is one instance.
 
 # keep window on exit option
-	 always eep window
+	 always keep window
 
 # display error if process doesnt start
 
@@ -28,12 +28,3 @@ To read a dead pane's earlier output, add scrollback: tmux capture-pane -p -S -1
 
 One caveat about where this applies: these run inside this chat's cloud VM. Backgrounding a shell command with & inside a run_terminal_command call is not a substitute — tmux is the right tool precisely because the daemon outlives the call.
 
-All test sessions were killed afterward; nothing is left running.
-
-
-
-
-
-# bindings doesn work
-
-tmux bind-key q display-popup -E -w 90% -h 80% "tmux-bg switch"
