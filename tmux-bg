@@ -7,13 +7,16 @@ set -euo pipefail
 DEFAULT_SESSION="programs"
 SESSION="$DEFAULT_SESSION"
 ATTACH_AFTER_START=0
+POPUP_WIDTH="95%"
+POPUP_HEIGHT="90%"
+NO_POPUP=0
 
 usage() {
     cat <<'EOF'
 Usage:
-  tmux-bg [--session NAME] run [--attach] PROGRAM [ARG...]
-  tmux-bg [--session NAME] switch
-  tmux-bg [--session NAME] kill
+  tmux-bg [--session NAME] run [--attach] [--close-on-exit] PROGRAM [ARG...]
+  tmux-bg [--session NAME] [--popup-width W] [--popup-height H] switch
+  tmux-bg [--session NAME] [--popup-width W] [--popup-height H] kill
   tmux-bg [--session NAME] list
   tmux-bg [--session NAME] clean-up
 
@@ -26,13 +29,24 @@ Commands:
   clean-up  Remove managed windows whose panes have exited.
 
 Options:
-  --session NAME   Use another tmux session (default: programs).
-  --attach         After starting or finding a program, switch to it.
-  -h, --help       Show this help.
+  --session NAME     Use another tmux session (default: programs).
+  --popup-width W    Picker popup width, cells or percent (default: 95%).
+  --popup-height H   Picker popup height, cells or percent (default: 90%).
+  --no-popup         Never open a popup: pick inline in the current
+                     terminal instead.
+  --attach           After starting or finding a program, switch to it.
+  -h, --help         Show this help.
 
-The run command is detached by default. PROGRAM is identified by its resolved
-executable path and the canonical current directory. Arguments do not create
-separate instances: the same executable in the same directory is one instance.
+The run command is detached by default. PROGRAM may be a PATH command or a
+shell alias from your rc files (v can start vim). PROGRAM is identified by
+its resolved executable path and the canonical current directory; arguments
+do not create separate instances: the same executable in the same directory
+is one instance. If the instance was started with different arguments, the
+new arguments are ignored and tmux-bg says so.
+
+A managed window stays open when its program exits, so output and errors
+remain visible; clean-up removes exited windows. --close-on-exit closes the
+window as soon as the program exits instead.
 EOF
 }
 
@@ -109,12 +123,39 @@ switch_to_window() {
     tmux select-window -t "$target"
 }
 
+resolve_program() {
+    # Resolve REQUESTED to something runnable: a PATH command, or a shell
+    # alias from the user's interactive rc files. Aliases do not exist in
+    # non-interactive shells, so ask one: `v' may expand to `vim -o'.
+    local requested=$1 expansion
+    if command -v -- "$requested" >/dev/null 2>&1; then
+        printf '%s\n' "$requested"
+        return 0
+    fi
+    expansion="$(bash -ic 'type -- "$1"' _ "$requested" 2>/dev/null |
+        grep -m1 'aliased to' || true)"
+    [[ -n "$expansion" ]] || return 1
+    expansion="${expansion#*\`}"
+    expansion="${expansion%\'}"
+    printf '%s\n' "$expansion"
+}
+
+window_pane_dead() {
+    # 1 when every pane of the window has exited, 0 otherwise.
+    tmux list-panes -t "$1" -F '#{pane_dead}' 2>/dev/null | head -n 1 || true
+}
+
 find_existing() {
     local wanted_program=$1 wanted_directory=$2
     local window program directory
 
     while IFS=$'\t' read -r window program directory; do
         [[ -n "$window" ]] || continue
+        # A leftover window with exited panes is not a running instance:
+        # start a new one instead of focusing the dead window.
+        if [[ "$(window_pane_dead "$window")" == "1" ]]; then
+            continue
+        fi
         if [[ "$program" == "$wanted_program" &&
               "$directory" == "$wanted_directory" ]]; then
             printf '%s\n' "$window"
@@ -124,24 +165,74 @@ find_existing() {
     return 1
 }
 
+check_spawn() {
+    # Briefly watch a freshly started window. When the process dies at
+    # once with a failing status (unknown command, bad arguments), surface
+    # the pane output as an error instead of failing silently. The window
+    # itself is kept by remain-on-exit for inspection.
+    local window_id=$1 requested=$2
+    local i dead="" status="" output
+
+    for i in 1 2 3 4 5; do
+        sleep 0.2
+        dead="$(window_pane_dead "$window_id")"
+        if [[ "$dead" == "1" ]]; then
+            break
+        fi
+        dead=""
+    done
+    [[ "$dead" == "1" ]] || return 0
+
+    status="$(tmux list-panes -t "$window_id" -F '#{pane_dead_status}' 2>/dev/null | head -n 1 || true)"
+    if [[ -z "$status" || "$status" == "0" ]]; then
+        return 0  # exited cleanly: not an error, output stays in the window
+    fi
+
+    output="$(tmux capture-pane -p -t "$window_id" 2>/dev/null |
+        grep -m1 -v '^[[:space:]]*$' || true)"
+    [[ -n "$output" ]] || output="(no output)"
+    if [[ ${#output} -gt 80 ]]; then
+        output="${output:0:77}..."
+    fi
+
+    local message="tmux-bg: $requested exited immediately (exit $status): $output"
+    printf '%s\n' "$message"
+    tmux display-message "$message" 2>/dev/null || true
+}
+
 run_program() {
     local attach=$ATTACH_AFTER_START
-    if [[ "${1:-}" == "--attach" ]]; then
-        attach=1
+    local keep=1
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            --attach)        attach=1 ;;
+            --close-on-exit) keep=0 ;;
+            --)              shift; break ;;
+            *)               die "unknown run option: $1 (try --help)" ;;
+        esac
         shift
-    fi
-    [[ "${1:-}" != "--" ]] || shift
+    done
     (($# >= 1)) || die "run requires PROGRAM [ARG...]"
 
     local requested=$1
     shift
 
-    local executable
-    executable="$(command -v -- "$requested")" ||
+    # Accept PATH commands and shell aliases (v -> vim -o).
+    local -a cmd_words=()
+    local resolution
+    if ! resolution="$(resolve_program "$requested")"; then
         die "program not found: $requested"
+    fi
+    read -r -a cmd_words <<< "$resolution"
+    [[ ${#cmd_words[@]} -ge 1 ]] || die "program not found: $requested"
+
+    local executable
+    executable="$(command -v -- "${cmd_words[0]}")" ||
+        die "cannot resolve program: ${cmd_words[0]}"
     executable="$(readlink -f -- "$executable")" ||
-        die "cannot resolve executable: $requested"
+        die "cannot resolve executable: $executable"
     [[ -x "$executable" ]] || die "not executable: $executable"
+    cmd_words[0]="$executable"
 
     local directory
     directory="$(pwd -P)"
@@ -152,6 +243,12 @@ run_program() {
         local existing
         if existing="$(find_existing "$executable" "$directory")"; then
             printf 'Already running: %s in %s\n' "$requested" "$directory"
+            local stored_args
+            stored_args="$(window_option "$existing" @managed_args)"
+            if [[ -n "$*" && "$*" != "$stored_args" ]]; then
+                printf 'Note: keeping the original arguments of the instance (%s), new ones ignored: %s\n' \
+                    "${stored_args:-(none)}" "$*"
+            fi
             if (( attach )); then
                 switch_to_window "$existing"
             fi
@@ -161,32 +258,45 @@ run_program() {
 
     # Quote every argument for the shell tmux uses to start the pane command.
     local command_line
-    printf -v command_line '%q ' "$executable" "$@"
+    printf -v command_line '%q ' "${cmd_words[@]}" "$@"
     command_line="exec ${command_line% }"
 
     local title window_id
     title="$(window_title "$executable" "$directory")"
 
+    # remain-on-exit keeps the window when the process exits, so output and
+    # errors stay visible and quick commands (run ls) survive long enough
+    # for the bookkeeping below. It is chained onto the same tmux call so
+    # it is in place before the process can possibly exit.
+    local keep_value=on
+    (( keep )) || keep_value=off
+
     if session_exists; then
         window_id="$(
             tmux new-window -d -P -F '#{window_id}' \
-                -t "=$SESSION" -c "$directory" -n "$title" "$command_line"
+                -t "=$SESSION" -c "$directory" -n "$title" "$command_line" \
+                \; set-option -w remain-on-exit "$keep_value"
         )"
     else
         window_id="$(
             tmux new-session -d -P -F '#{window_id}' \
-                -s "$SESSION" -c "$directory" -n "$title" "$command_line"
+                -s "$SESSION" -c "$directory" -n "$title" "$command_line" \
+                \; set-option -w remain-on-exit "$keep_value"
         )"
     fi
+    [[ -n "$window_id" ]] || die "tmux did not report a window id"
 
     tmux set-option -w -t "$window_id" @managed_program "$executable"
     tmux set-option -w -t "$window_id" @managed_directory "$directory"
     tmux set-option -w -t "$window_id" @managed_title "$title"
+    tmux set-option -w -t "$window_id" @managed_args "$*"
     tmux set-option -w -t "$window_id" @managed_version "1"
 
     printf 'Started %s in session %s: %s\n' "$requested" "$SESSION" "$title"
     if (( attach )); then
         switch_to_window "$window_id"
+    else
+        check_spawn "$window_id" "$requested"
     fi
 }
 
@@ -232,19 +342,24 @@ pick_windows() {
         return 0
     fi
 
-    # fzf needs a terminal to draw in. When started from a key binding
-    # without a popup wrapper (run-shell) there is none: re-run this
-    # script inside a tmux popup and pick there. Inside a popup or a
-    # pane stdin is a tty, so the re-invocation skips this and the
-    # popup opens at most once. kill always arrives inside the popup
-    # its own key binding opens.
-    if [[ "$action" != "kill" ]] && [[ ! -t 0 ]] && [[ -z "${TMUX_BG_POPUP:-}" ]]; then
+    # fzf needs a terminal to draw in. Started from a key binding without
+    # a popup wrapper (run-shell) there is none: re-run this script inside
+    # a tmux popup and pick there. Inside a popup or a pane stdin is a tty,
+    # so the re-invocation skips this and the popup opens at most once.
+    # The records were checked above, so the popup only opens when there
+    # is something to pick. --no-popup keeps the picker inline instead;
+    # then a real terminal is required.
+    if [[ -z "${TMUX_BG_POPUP:-}" ]] && [[ ! -t 0 ]]; then
+        if (( NO_POPUP )); then
+            die "--no-popup needs a terminal: run tmux-bg $action inside a pane"
+        fi
         local self=$0
         if [[ "$self" != */* ]]; then
             self="$(command -v -- "$self" || printf '%s' "$self")"
         fi
-        exec tmux display-popup -E -w 95% -h 90% \
-            env TMUX_BG_POPUP=1 "$self" --session "$SESSION" switch
+        exec tmux display-popup -E \
+            -w "$POPUP_WIDTH" -h "$POPUP_HEIGHT" \
+            env TMUX_BG_POPUP=1 "$self" --session "$SESSION" "$action"
     fi
 
     require_fzf
@@ -328,7 +443,7 @@ clean_up() {
 }
 
 main() {
-    require_tmux
+    # Every command calls require_tmux itself; --help must work anywhere.
 
     while (($#)); do
         case "$1" in
@@ -336,6 +451,21 @@ main() {
                 (($# >= 2)) || die "--session requires a name"
                 SESSION=$2
                 shift 2
+                ;;
+            --popup-width|--popup-height)
+                (($# >= 2)) || die "$1 requires a value"
+                [[ "$2" =~ ^[0-9]+%?$ ]] ||
+                    die "$1 expects a size like 80 or 95%"
+                if [[ "$1" == "--popup-width" ]]; then
+                    POPUP_WIDTH=$2
+                else
+                    POPUP_HEIGHT=$2
+                fi
+                shift 2
+                ;;
+            --no-popup)
+                NO_POPUP=1
+                shift
                 ;;
             --attach)
                 ATTACH_AFTER_START=1
