@@ -1,30 +1,21 @@
+# accept aliases instead of commands
+tmux-bg v todo # v is an alias for vim
+
+# avoid flicker
+
+check that there are processes running before doing anything.
+
+# run bash commands doesn't work
+
+run ls # doesn't work
+run 'bash -c "ls"' # doesn't work
+I get error: no such window: @51
 
 # make it argument sensitive
 
-Arguments do not create separate instances: the same executable in the same directory is one instance.
+Arguments should not create separate instances.
 
 # keep window on exit option
-	 always keep window
 
 # display error if process doesnt start
-
-Session exists? tmux has-session -t myapp — exit 0 means the window is still alive.
-Process alive? grab #{pane_pid} and kill -0 "$pid". This works even if the pane has already closed, unlike list-panes.
-Exit code? needs remain-on-exit, otherwise the window is destroyed the instant the command exits and you have no evidence at all.
-
-The gotcha that cost me two attempts
-remain-on-exit is a window option, and set-option -w -t myapp only affects the currently selected window — new windows won't inherit it, so a failing program's window still vanishes. Set it globally after a session exists (setting it before fails, since a session-less server exits immediately):
-
-bash
-Copy
-tmux new-session -d -s myapp -n main 'sleep 300'
-tmux set-option -g remain-on-exit on      # now new windows survive death
-Without remain-on-exit, wrap the command to record the status — verified working, produced EXIT:7 while the window itself disappeared:
-
-bash
-Copy
-tmux new-window -t myapp -n job "sh -c 'sleep 0.3; exit 7'; echo \"EXIT:\$?\" > /tmp/job.status"
-To read a dead pane's earlier output, add scrollback: tmux capture-pane -p -S -100 -t myapp:main (plain -p shows only the visible screen, which for a dead pane can be just the "Pane is dead" line).
-
-One caveat about where this applies: these run inside this chat's cloud VM. Backgrounding a shell command with & inside a run_terminal_command call is not a substitute — tmux is the right tool precisely because the daemon outlives the call.
 

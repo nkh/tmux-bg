@@ -218,12 +218,36 @@ pick_windows() {
         # fall through to the picker so the key still does something useful.
     fi
 
-    require_fzf
     session_exists || die "session '$SESSION' does not exist"
 
     local records
     records="$(picker_records)"
     [[ -n "$records" ]] || die "no managed programs in session '$SESSION'"
+
+    # With a single managed program there is nothing to choose from:
+    # select it directly instead of opening the fzf popup. Records are
+    # sanitized by safe_display, so each one is exactly one line.
+    if [[ "$action" != "kill" ]] && [[ "$records" != *$'\n'* ]]; then
+        switch_to_window "${records%%$'\t'*}"
+        return 0
+    fi
+
+    # fzf needs a terminal to draw in. When started from a key binding
+    # without a popup wrapper (run-shell) there is none: re-run this
+    # script inside a tmux popup and pick there. Inside a popup or a
+    # pane stdin is a tty, so the re-invocation skips this and the
+    # popup opens at most once. kill always arrives inside the popup
+    # its own key binding opens.
+    if [[ "$action" != "kill" ]] && [[ ! -t 0 ]] && [[ -z "${TMUX_BG_POPUP:-}" ]]; then
+        local self=$0
+        if [[ "$self" != */* ]]; then
+            self="$(command -v -- "$self" || printf '%s' "$self")"
+        fi
+        exec tmux display-popup -E -w 95% -h 90% \
+            env TMUX_BG_POPUP=1 "$self" --session "$SESSION" switch
+    fi
+
+    require_fzf
 
     local selected
     if [[ "$action" == "kill" ]]; then
